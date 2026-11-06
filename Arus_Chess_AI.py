@@ -38,10 +38,9 @@ class ChessBot:
                     try: self.engine.quit()
                     except: pass
                 self.engine = chess.engine.SimpleEngine.popen_uci(find_stockfish())
-                self.engine.configure({"Skill Level": 20, "Threads": 2, "Hash": 128}) 
+                self.engine.configure({"Skill Level": 20, "Threads": 2, "Hash": 64}) 
                 return True
             except Exception as e:
-                self.log(f"[!] Ошибка Stockfish: {e}")
                 self.engine = None
                 return False
 
@@ -137,7 +136,6 @@ class ChessBot:
         try: return self.driver.execute_script(js_script)
         except: return None
 
-    # ========== НОВАЯ ФУНКЦИЯ ОТРИСОВКИ (СТРЕЛКА + УГОЛКИ + ЗАЛИВКА) ==========
     def draw_arrow_and_esp(self, from_sq, to_sq, win_prob):
         self._ensure_overlay()
         js_script = f"""
@@ -169,7 +167,6 @@ class ChessBot:
             var p1 = getCoords('{from_sq}'); var p2 = getCoords('{to_sq}');
             var headlen = sqSize * 0.4; var angle = Math.atan2(p2.cy - p1.cy, p2.cx - p1.cx);
             
-            // Рисуем стрелку
             ctx.shadowColor = '#478df5'; ctx.shadowBlur = 15;
             ctx.beginPath(); ctx.moveTo(p1.cx, p1.cy); ctx.lineTo(p2.cx, p2.cy);
             ctx.strokeStyle = '#478df5'; ctx.lineWidth = sqSize * 0.12; ctx.lineCap = 'round'; ctx.stroke();
@@ -182,10 +179,9 @@ class ChessBot:
             
             ctx.beginPath(); ctx.arc(p1.cx, p1.cy, sqSize * 0.15, 0, Math.PI * 2); ctx.fillStyle = '#478df5'; ctx.fill();
 
-            // Рисуем УГОЛКИ И ЗАЛИВКУ на 2 клетки (Откуда и Куда)
-            var bSize = sqSize * 0.3; // Размер уголков
-            var bw = 4;               // Толщина линий
-            var col = '#478df5';      // Цвет (совпадает со стрелкой)
+            var bSize = sqSize * 0.3; 
+            var bw = 4;               
+            var col = '#478df5';      
 
             function drawCorners(coord) {{
                 return `
@@ -197,11 +193,9 @@ class ChessBot:
                 </div>`;
             }}
 
-            // Очищаем старые элементы (ESP и плашку)
             var olds = divLayer.querySelectorAll('.esp-square, .prob-tag');
             for(var i=0; i<olds.length; i++) olds[i].remove();
 
-            // Добавляем новые
             divLayer.insertAdjacentHTML('beforeend', drawCorners(p1) + drawCorners(p2));
 
             var probDiv = document.createElement('div');
@@ -231,6 +225,26 @@ class ChessBot:
             """)
         except: pass
 
+    def safe_analyze(self, board):
+        for attempt in range(3):
+            if not self.running: return None
+            try:
+                with self.engine_lock:
+                    if not self.engine:
+                        self.log("[*] Движок не найден. Попытка запуска...")
+                        if not self.init_engine():
+                            time.sleep(1)
+                            continue
+                    result = self.engine.play(board, chess.engine.Limit(time=self.think_time))
+                    return result
+            except (chess.engine.EngineTerminatedError, BrokenPipeError, Exception) as e:
+                self.log(f"[!] Сбой движка. Авто-рестарт...")
+                time.sleep(1)
+                with self.engine_lock:
+                    self.init_engine() 
+        self.log("[!] Не удалось восстановить движок.")
+        return None
+
     def run_bot(self, stockfish_path, think_time):
         self.running = True
         self.think_time = think_time
@@ -241,93 +255,107 @@ class ChessBot:
         
         self.log("[*] Запуск Stockfish...")
         if not self.init_engine():
-            self.running = False
-            return
+            self.log("[!] Ошибка первого запуска, ждем...")
+            time.sleep(2)
         self.log("[+] Готов к игре.")
+        self.log("[+] Система авто-восстановления активна.")
 
+        last_board_time = time.time()
+        
         while self.running:
             try:
                 self._ensure_overlay() 
                 state = self.get_game_state()
+                
                 if not state:
-                    time.sleep(0.2)
+                    if time.time() - last_board_time > 10.0:
+                        self.log("[!] Браузер завис. Авто-перезагрузка...")
+                        try:
+                            self.driver.refresh()
+                            time.sleep(3)
+                            self._ensure_overlay()
+                            self.clear_arrow()
+                            self.last_pieces = ""
+                            self.analyzed_pieces = ""
+                            self.my_color = None
+                        except: pass
+                        last_board_time = time.time()
+                    time.sleep(0.5)
                     continue
+                
+                last_board_time = time.time()
 
                 pieces = state['pieces']
                 is_flipped = state['is_flipped']
 
-                # 1. Инициализация игры
-                if self.my_color is None or (pieces == START_FEN and self.last_pieces != START_FEN):
-                    self.my_color = 'b' if is_flipped else 'w'
-                    self.internal_turn = 'w'
-                    self.log(f"[+] Новая партия. Играем за {'БЕЛЫХ' if self.my_color == 'w' else 'ЧЕРНЫХ'}")
+                # --- ОЖИДАНИЕ НАЧАЛА ПАРТИИ ---
+                if pieces == START_FEN:
+                    if self.last_pieces != START_FEN:
+                        self.log("[*] Ожидание начала партии...")
+                    
+                    # Пока партия не началась, мы не знаем цвет.
+                    self.my_color = None 
                     self.last_pieces = pieces
                     self.analyzed_pieces = ""
+                    self.internal_turn = "w"
                     self.clear_arrow()
-
-                # Ждем начала партии
-                if pieces == START_FEN:
                     time.sleep(0.5)
                     continue
 
-                # 2. Изменение позиции (был ход)
+                # --- ПЕРВЫЙ ХОД СДЕЛАН (ОПРЕДЕЛЯЕМ ЦВЕТ) ---
+                if self.my_color is None:
+                    self.my_color = 'b' if is_flipped else 'w'
+                    self.log(f"[+] Партия началась! Играем за {'БЕЛЫХ' if self.my_color == 'w' else 'ЧЕРНЫХ'}")
+
+                # Если доска изменилась (был ход)
                 if pieces != self.last_pieces:
                     self.last_pieces = pieces
                     self.internal_turn = "b" if self.internal_turn == "w" else "w"
-                    self.clear_arrow() # Стираем стрелку и ESP после хода
+                    self.clear_arrow() 
                     self.analyzed_pieces = ""
                     time.sleep(0.6) 
 
-                # 3. Ход противника (ждем)
+                # Если ход противника (ждем)
                 if self.internal_turn != self.my_color:
                     time.sleep(0.1)
                     continue
 
-                # 4. Наш ход (делаем 1 анализ)
+                # Наш ход (делаем 1 анализ)
                 if pieces != self.analyzed_pieces:
                     self.analyzed_pieces = pieces
                     
                     self.log("[*] Анализ...")
                     try:
                         board = chess.Board(f"{pieces} {self.internal_turn} - - 0 1")
-                    except:
+                        if not board.is_valid():
+                            continue
+                    except ValueError:
                         continue
                     
                     if board.is_game_over():
                         continue
 
-                    try:
-                        with self.engine_lock:
-                            if not self.engine: 
-                                if not self.init_engine(): continue
+                    result = self.safe_analyze(board)
 
-                            result = self.engine.play(board, chess.engine.Limit(time=self.think_time))
-                            best = result.move
-                            
-                            win_prob = 50.0
-                            if 'score' in result.info:
-                                s = result.info['score'].white()
-                                if s.is_mate(): win_prob = 100 if s.mate() > 0 else 0
-                                elif s.score() is not None:
-                                    cp = s.score()
-                                    win_prob = round((1 / (1 + math.exp(-cp / 400))) * 100, 1)
-                    except chess.engine.EngineTerminatedError:
-                        self.log("[!] Движок упал. Перезапуск...")
-                        with self.engine_lock:
-                            self.init_engine()
-                        self.analyzed_pieces = ""
-                        continue
-                    except Exception as e:
-                        continue
-
-                    if best:
+                    if result and result.move:
+                        best = result.move
+                        win_prob = 50.0
+                        if 'score' in result.info:
+                            s = result.info['score'].white()
+                            if s.is_mate(): win_prob = 100 if s.mate() > 0 else 0
+                            elif s.score() is not None:
+                                cp = s.score()
+                                win_prob = round((1 / (1 + math.exp(-cp / 400))) * 100, 1)
+                                
                         from_sq = chess.square_name(best.from_square)
                         to_sq = chess.square_name(best.to_square)
                         self.log(f"-> {from_sq.upper()}{to_sq.upper()} ({win_prob}%)")
-                        # Вызываем новую функцию, которая рисует и стрелку, и уголки
                         self.draw_arrow_and_esp(from_sq, to_sq, win_prob)
+                    else:
+                        time.sleep(5)
+                        self.analyzed_pieces = "" 
 
-                time.sleep(0.05)
+                time.sleep(0.1)
             except Exception as e:
                 time.sleep(1)
         self.stop()
@@ -467,4 +495,4 @@ class ModernGUI:
 if __name__ == "__main__":
     root = tk.Tk()
     app = ModernGUI(root)
-    root.mainloop()
+    app.root.mainloop() if hasattr(app, 'root') else root.mainloop()
